@@ -1,0 +1,1 @@
+gh ado2gh migrate-repo --ado-org "iDealADO" --ado-team-project "iDeal" --ado-repo "iDeal" --github-org "Deloitte-US-Consulting-HO" --github-repo "iDeal"

@@ -1,0 +1,237 @@
+trigger: none
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  - name: currentDate
+    value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+  - group: migration
+
+stages:
+- stage: 'PreMigration_Report'
+  jobs:
+  - job: PreMigration_Report
+    timeoutInMinutes: 360
+    steps:
+        - task: PowerShell@2
+          inputs:
+            targetType: 'inline'
+            script: |
+              $env:GH_PAT="$(GH_PAT)"
+              $env:ADO_PAT="$(ADO_PAT)"
+          displayName: set env variables
+
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              echo $GH_PAT | gh auth login --with-token
+              gh extension install github/gh-ado2gh
+              gh extension upgrade github/gh-ado2gh
+          displayName: install ado2gh plugin
+     
+        
+        - task: replacetokens@6
+          inputs:
+            root: '$(System.DefaultWorkingDirectory)/'
+            sources: |
+              scripts/**
+            tokenPattern: 'doubleunderscores'
+          
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              cd scripts 
+              ls
+              pip install -r requirements.txt 
+              echo 'running get org details command'
+              gh ado2gh inventory-report --ado-org $(org)
+              echo "filter out report based on project name"
+              python filter_inventory_reports_projectName.py
+              echo 'running release pipeline script'
+              python fetch_Release_Pipeline.py
+              echo 'running get user details script'
+              python get_usersDetails_project.py 
+              echo 'merging csv files'
+              python mergeCSV.py
+              echo 'uploading files in storage account'
+              az storage blob upload --account-name adoterraformbackend --account-key $(access_key) --container-name adoorginfo --file $(org)_inventory_report.xlsx --name $(org)_inventory_report.xlsx --overwrite
+          displayName: generate report
+        
+        - task: CopyFiles@2
+          inputs:
+            SourceFolder: '$(System.DefaultWorkingDirectory)/scripts/'
+            Contents: '**inventory_report.xlsx'
+            TargetFolder: '$(build.artifactstagingdirectory)'
+        
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+
+- stage: 'Migration_Run'
+  jobs:
+  - job: Migration_Run
+    timeoutInMinutes: 720
+    steps:
+        - task: PowerShell@2
+          inputs:
+            targetType: 'inline'
+            script: |
+              $env:GH_PAT="$(GH_PAT)"
+              $env:ADO_PAT="$(ADO_PAT)"
+          displayName: set env variables
+          
+        - task: replacetokens@6
+          inputs:
+            root: '$(System.DefaultWorkingDirectory)/'
+            sources: |
+              scripts/**
+            tokenPattern: 'doubleunderscores'
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              echo $GH_PAT | gh auth login --with-token
+              gh extension install github/gh-ado2gh
+              gh extension upgrade github/gh-ado2gh
+          displayName: install ado2gh plugin
+
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              cd scripts && pip install -r requirements.txt && python migrate_project_to_ado.py
+              ls -l
+              cat migratetogh.ps1
+          displayName:  generating migration script
+          
+        - task: PowerShell@2
+          inputs:
+            filePath: 'scripts/migratetogh.ps1'
+          displayName: 'run migration script'
+
+- stage: 'Post_Migration_Script'
+  jobs:
+  - job: Post_Migration_Script
+    timeoutInMinutes: 360
+    steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.x'
+            addToPath: true
+            architecture: 'x64'
+          displayName: install python
+        
+        - task: replacetokens@6
+          inputs:
+            root: '$(System.DefaultWorkingDirectory)/'
+            sources: |
+              validate/**
+              ruleset/**
+            tokenPattern: 'doubleunderscores'
+
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              cd validate && pip install -r requirements.txt && python main.py
+          displayName: validate
+        
+        - task: CopyFiles@2
+          inputs:
+            SourceFolder: '$(System.DefaultWorkingDirectory)/validate/'
+            Contents: '**.xlsx'
+            TargetFolder: '$(build.artifactstagingdirectory)'
+        
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+
+- stage: 'Apply_Branch_Policies'
+  jobs:
+  - job: Apply_Branch_Policies
+    timeoutInMinutes: 360
+    steps:
+        - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+          inputs:
+            terraformVersion: 'latest'
+          displayName: 'install terraform'
+
+        - task: replacetokens@6
+          inputs:
+            root: '$(System.DefaultWorkingDirectory)/'
+            sources: |
+              validate/**
+              ruleset/**
+            tokenPattern: 'doubleunderscores'
+        
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.x'
+            addToPath: true
+            architecture: 'x64'
+          displayName: install python
+        
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              cd ruleset && pip install requests && python main.py
+              cat terraform.tfvars
+          displayName: get branches
+        
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              cd ruleset
+              terraform fmt
+              terraform init
+              terraform plan
+              terraform apply --auto-approve
+              pip install requests && python allow.py
+          displayName: apply branch rules
+
+- stage: 'Get_rewire_commands'
+  jobs:
+  - job: Apply_Branch_Policies
+    timeoutInMinutes: 360
+    steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.x'
+            addToPath: true
+            architecture: 'x64'
+        
+        - task: replacetokens@6
+          inputs:
+            root: '$(System.DefaultWorkingDirectory)/'
+            sources: |
+              scripts/**
+            tokenPattern: 'doubleunderscores'
+        
+        - task: Bash@3
+          inputs:
+            targetType: 'inline'
+            script: |
+              cd scripts && pip install requests &&  python get_rewire_commands.py
+          displayName: generate commands
+        
+        - task: CopyFiles@2
+          inputs:
+            SourceFolder: '$(System.DefaultWorkingDirectory)/scripts/'
+            Contents: 'pipelines.txt'
+            TargetFolder: '$(build.artifactstagingdirectory)'
+        
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+
